@@ -1,0 +1,44 @@
+<Window x:Class="NotifyRedirect.App.MainWindow" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Title="通知转发器 · NotifyRedirect" Width="1060" Height="760" MinWidth="850" MinHeight="620" Background="#F5F7FB" FontFamily="Microsoft YaHei UI" FontSize="14">
+ <Grid Margin="24"><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+  <StackPanel Margin="0,0,0,18"><TextBlock Text="通知转发器" FontSize="28" FontWeight="SemiBold" Foreground="#0F172A"/><TextBlock Text="让电脑继续工作，让结果找到你。" Foreground="#64748B" Margin="0,5,0,0"/></StackPanel>
+  <TabControl Grid.Row="1" Padding="20" Background="White" BorderBrush="#E2E8F0">
+   <TabItem Header="  首页  "><ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel>
+    <TextBlock Text="后台状态" FontSize="22" FontWeight="SemiBold"/><TextBlock x:Name="StatusText" Margin="0,16,0,8" TextWrapping="Wrap"/><TextBlock x:Name="ScheduleStatus" Margin="0,0,0,16"/>
+    <WrapPanel><Button Content="授权读取 Windows 通知" Click="Authorize_Click"/><Button Content="刷新通知" Click="Refresh_Click"/><Button Content="暂停转发" Click="Pause_Click"/><Button Content="退出程序" Click="Exit_Click"/></WrapPanel>
+    <Border Background="#EFF6FF" Padding="16" Margin="0,16,0,16"><TextBlock TextWrapping="Wrap" Text="首次使用：授权通知 → 在通知来源中勾选应用 → 添加接收渠道 → 保存时间规则。锁屏后保持电脑唤醒和联网；屏幕可以关闭。关闭窗口后继续在托盘运行。"/></Border>
+    <TextBlock Text="最近捕获的消息" FontSize="18" Margin="0,0,0,8"/><TextBox x:Name="PreviewText" IsReadOnly="True" AcceptsReturn="True" Height="180" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"/>
+    <CheckBox x:Name="StartupCheck" Content="登录 Windows 后启动" Checked="Startup_Changed" Unchecked="Startup_Changed"/>
+   </StackPanel></ScrollViewer></TabItem>
+   <TabItem Header="  通知来源  "><ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel>
+    <TextBlock Text="选择需要转发的应用" FontSize="22"/><TextBlock Margin="0,8,0,14" TextWrapping="Wrap" Foreground="#64748B" Text="应用发出通知后会出现在列表中。默认不转发任何应用。选中后点击保存。"/>
+    <ListBox x:Name="SourceList" Height="260" BorderBrush="#E2E8F0"/>
+    <TextBlock Text="包含关键词（每行一个；留空表示不限）" Margin="0,16,0,0"/><TextBox x:Name="IncludeWords" AcceptsReturn="True" Height="65"/>
+    <TextBlock Text="排除关键词（每行一个；排除优先）"/><TextBox x:Name="ExcludeWords" AcceptsReturn="True" Height="65"/>
+    <Button Content="保存来源与过滤规则" Click="SaveSources_Click" HorizontalAlignment="Left"/>
+   </StackPanel></ScrollViewer></TabItem>
+   <TabItem Header="  接收渠道  "><ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel>
+    <TextBlock Text="接收渠道" FontSize="22"/><TextBlock Text="配置保存在这台电脑，密钥使用 Windows 用户保护。" Foreground="#64748B" Margin="0,8,0,12"/>
+    <ListBox x:Name="ChannelList" Height="130" SelectionChanged="Channel_Selected"/>
+    <TextBlock Text="渠道名称"/><TextBox x:Name="ChannelName"/>
+    <TextBlock Text="平台"/><ComboBox x:Name="ChannelKindBox" SelectedIndex="0"><ComboBoxItem Content="飞书群机器人"/><ComboBoxItem Content="钉钉旧群机器人（仅已有 Webhook）"/><ComboBoxItem Content="企业微信消息推送 / 群机器人"/></ComboBox>
+    <TextBlock Text="Webhook 地址（编辑已有渠道时留空保留）"/><PasswordBox x:Name="WebhookBox" Padding="8" Margin="0,4,0,12"/>
+    <TextBlock Text="签名密钥（飞书 / 钉钉；留空保留已有密钥）"/><PasswordBox x:Name="SigningBox" Padding="8" Margin="0,4,0,12"/>
+    <CheckBox x:Name="ChannelEnabled" Content="启用渠道" IsChecked="True"/>
+    <WrapPanel><Button Content="保存渠道" Click="SaveChannel_Click"/><Button Content="新建" Click="NewChannel_Click"/><Button Content="发送测试消息" Click="TestChannel_Click"/><Button Content="删除所选渠道" Click="DeleteChannel_Click"/></WrapPanel>
+    <TextBlock TextWrapping="Wrap" Foreground="#64748B" Text="测试消息会立即发送，不受自动转发时段限制。平台还可能要求安全关键词或组织权限。钉钉新机器人方案暂未接入。所有渠道在手机实际收到前均视为未实测。"/>
+   </StackPanel></ScrollViewer></TabItem>
+   <TabItem Header="  规则与记录  "><ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel>
+    <TextBlock Text="转发时间" FontSize="22"/><ComboBox x:Name="ModeBox" SelectedIndex="2"><ComboBoxItem Content="全天转发"/><ComboBoxItem Content="按时间段转发"/><ComboBoxItem Content="暂停转发"/></ComboBox>
+    <TextBlock Text="每行：星期 | 开始 | 结束；星期用 1–7（7 为周日），全天写 all"/><TextBox x:Name="WindowsText" AcceptsReturn="True" Height="95" FontFamily="Consolas" Text="1,2,3,4,5 | 18:30 | 09:00&#10;6,7 | all"/>
+    <TextBlock Text="跨午夜的星期按开始日计算；时段外的通知不积攒补发。" Foreground="#64748B"/>
+    <TextBlock Text="电脑名称" Margin="0,10,0,0"/><TextBox x:Name="ComputerName"/>
+    <WrapPanel><Button Content="保存时间规则" Click="SaveRules_Click"/><Button Content="导出配置（不含密钥）" Click="Export_Click"/><Button Content="导入配置" Click="Import_Click"/></WrapPanel>
+    <CheckBox x:Name="ApiEnabled" Content="启用本机 Agent 接入口（127.0.0.1:17841）" Checked="Api_Changed" Unchecked="Api_Changed"/>
+    <TextBlock Text="发送记录" FontSize="18" Margin="0,10,0,8"/><ListBox x:Name="HistoryList" Height="160" DisplayMemberPath="Label" SelectionChanged="History_Selected"/>
+    <TextBox x:Name="HistoryDetail" IsReadOnly="True" AcceptsReturn="True" TextWrapping="Wrap" Height="110" VerticalScrollBarVisibility="Auto"/>
+    <WrapPanel Margin="0,8,0,0"><Button Content="刷新记录" Click="History_Click"/><Button Content="重发所选失败记录" Click="Retry_Click"/><Button Content="清空消息历史" Click="ClearHistory_Click"/></WrapPanel>
+   </StackPanel></ScrollViewer></TabItem>
+  </TabControl>
+  <TextBlock Grid.Row="2" x:Name="Feedback" Margin="0,14,0,0" TextWrapping="Wrap" Foreground="#475569"/>
+ </Grid>
+</Window>

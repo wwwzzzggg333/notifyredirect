@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:uap3="http://schemas.microsoft.com/appx/manifest/uap/windows10/3" xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities" IgnorableNamespaces="uap uap3 desktop rescap">
+ <Identity Name="NotifyRedirect.Desktop" Publisher="CN=NotifyRedirect Development" Version="0.1.0.0" ProcessorArchitecture="x64"/>
+ <Properties><DisplayName>通知转发器</DisplayName><PublisherDisplayName>NotifyRedirect</PublisherDisplayName><Logo>Assets\StoreLogo.png</Logo><Description>按时间段转发 Windows 通知到手机接收渠道。</Description></Properties>
+ <Dependencies><TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.22000.0" MaxVersionTested="10.0.26100.0"/></Dependencies>
+ <Resources><Resource Language="zh-CN"/></Resources>
+ <Applications><Application Id="App" Executable="NotifyRedirect.exe" EntryPoint="Windows.FullTrustApplication">
+  <uap:VisualElements DisplayName="通知转发器" Description="Windows 通知转发工具" BackgroundColor="#2563EB" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png"/>
+  <Extensions><desktop:Extension Category="windows.startupTask" Executable="NotifyRedirect.exe" EntryPoint="Windows.FullTrustApplication"><desktop:StartupTask TaskId="NotifyRedirectStartup" Enabled="false" DisplayName="通知转发器"/></desktop:Extension></Extensions>
+ </Application></Applications>
+ <Capabilities><Capability Name="internetClient"/><uap3:Capability Name="userNotificationListener"/><rescap:Capability Name="runFullTrust"/></Capabilities>
+</Package>
