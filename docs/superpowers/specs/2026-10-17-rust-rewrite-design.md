@@ -1,111 +1,81 @@
-# NotifyRedirect Rust 原生版设计
+# NotifyRedirect Rust 全新版本设计
 
 日期：2026-10-17
 
-状态：用户已同意 Rust 原生设置窗口＋系统托盘、保留当前功能的方向；本文件待审阅，尚未开始产品实现。
+状态：用户已确认 Rust 原生界面方向，并修正为全新版本；无需兼容旧版。本文据此更新，产品代码尚未开始实现。
 
-## 目标和边界
+## 目标与范围
 
-用户希望降低当前 Windows 通知转发 APP 的安装包体积。已选择 Rust，保留可视化配置和托盘体验，不要求用户安装 Python、Go、Rust 或 .NET 运行时。继续支持 Windows 11 x64；不在此次增加跨平台、Windows 服务、远程控制、云服务或新的机器人平台。
+交付 Windows 11 x64 的轻量通知转发工具，采用 Rust、中文原生设置窗口和系统托盘，用户无需安装开发工具或 .NET。保留通知读取、来源和关键词过滤、飞书/企业微信/已有钉钉 Webhook、时间规则、持久发送队列、历史记录和 Agent 接入等产品功能。
 
-当前 `artifacts/NotifyRedirect-0.1.0-x64.msix` 为 132,549,351 字节（约 126.4 MiB）。现版使用自包含 .NET 10、WPF、WinForms、ASP.NET Core；主程序和 CLI 分别自包含发布。Rust 版的包不携带这些运行时，不引入 Electron、WebView 或 Chromium。
+这是独立的新版本：不迁移旧数据库、配置、密钥或历史，不维持旧 JSON、枚举数值、时间格式、去重标识、CLI 参数或 API 协议。用户重新授权通知、选择来源、配置渠道；新配置导入导出只服务本版本。原 C# 源码留在仓库供参考，不成为运行或验证依赖。
 
-体积验收目标：Release x64 的主程序、CLI、资源合计不超过 20 MiB，MSIX 不超过 15 MiB。这是待构建验证的工程目标，不是已测结果；若无法达到，先分析依赖和链接产物，再说明差距，不通过删减约定功能达标。最终报告同时列出 EXE、未压缩安装内容和 MSIX 的实际字节数，与上述基线比较。
+当前旧 MSIX 为 132,549,351 字节（约 126.4 MiB），仅作体积基线。新版本 Release 主程序、CLI、资源合计目标 <=20 MiB，MSIX 目标 <=15 MiB；均待实测。不能用删减功能达标，未达时报告依赖分析和实际值。不引入 Electron、WebView、Chromium、OpenSSL 或 .NET 运行时。
 
-## 实现布局
+## 工程与依赖
 
-在 `native/` 中增加 Cargo workspace，原 C# 工程保留作为行为参考与回退版本。Rust 实现不调用或捆绑 C# 程序。
+`native/` 为 Cargo workspace，包含 `notifyredirect-core`（模型、规则、事件、文本）、`notifyredirect-storage`（SQLite、队列）、`notifyredirect-platform`（Windows 通知、DPAPI、WinHTTP、启动项）、`notifyredirect-app`（协调器、API、原生 UI/托盘）、`notifyredirect-cli`（本机提交工具）。
 
-- `notifyredirect-core`：模型、配置校验、时间窗口、来源和关键词过滤、去重指纹、Agent 事件校验、消息分段和重试决策。
-- `notifyredirect-platform`：Windows 通知、DPAPI、WinHTTP、登录启动和包身份适配。
-- `notifyredirect-storage`：SQLite 配置、凭据密文、观察账本、消息和分段队列。
-- `notifyredirect-app`：Win32 中文设置窗口、托盘、单实例、后台调度与本机 HTTP 服务。
-- `notifyredirect-cli`：保持现有命令行协议的轻量客户端，只读凭据并提交事件。
+使用 windows crate 调用系统接口；rusqlite 内置 SQLite；serde/serde_json 处理 JSON，chrono 处理时间。依赖精确固定并提交 Cargo.lock。Release 开启大小优化、LTO、单 codegen unit、去除调试符号。业务核心无 Windows 依赖，存储和系统层不互相依赖。
 
-使用微软 `windows` crate 访问 Win32、WinRT、DPAPI 和 WinHTTP，按实际使用启用功能。SQLite 使用 `rusqlite` 内置 SQLite，以保证无需另行安装数据库；JSON 使用 `serde`/`serde_json`，时间运算使用支持本地时区的 Rust 日期库。其他依赖仅按必要功能加入，在实施计划中固定版本并提交 Cargo.lock。Windows 网络请求使用系统 TLS，不额外捆绑 OpenSSL。
+## 独立安装与数据
 
-Release 启用大小优化、LTO、单 codegen unit、去除调试符号；调试版本仍保留正常诊断能力。不得为追求体积改变凭据保护或消息发送语义。
+MSIX Identity 为 `NotifyRedirect.Native`，Application Id 为 `App`，初始包版本 `1.0.0.0`，开发 Publisher 使用 `CN=NotifyRedirect Development`。主程序为 `NotifyRedirect.exe`，CLI 为 `tools/notifyredirect-cli.exe`；这些是新版本自身的文件名，不承诺旧集成可继续调用。
 
-## 界面与进程
+命名互斥为 `Local\NotifyRedirect.Native`，启动项 Id 为 `NotifyRedirectNativeStartup`。新旧版本可独立安装；新程序不发现、读取、覆盖或接管旧版数据。若两者均运行并开启同样来源，可能各自转发，使用说明提示用户退出旧版以免重复收件。
 
-原生 Win32 控件实现首页、通知来源、接收渠道、规则与记录四页，保留中文标签、密码输入框、文件选择框、滚动与键盘访问。保留授权、刷新、来源选择、关键词、渠道增删改启停和测试、时间规则、电脑名称、导入导出、历史详情、重发、清空历史、本机入口开关和登录启动。
+通过当前进程 LocalAppData 路径下 `NotifyRedirectNative/notifyredirect.db` 保存数据；MSIX 下允许系统正常重定向。CLI 只从新版固定目录、当前新版包身份对应的目录或显式 `--data-dir` 定位，不扫描旧包。
 
-主窗口关闭后隐藏，托盘提供打开、暂停和退出。窗口、托盘和通知授权在 UI 线程运行；SQLite 与转发队列由后台协调线程串行管理，网络操作不阻塞窗口消息循环。UI 与后台通过消息通道交互，退出时停止接入和调度，等待受限时间后退出；发送中未确认的记录保持不确定语义。
+新数据库使用独立 schema v1，应用只维护本版本的版本号。配置 JSON 为 snake_case，枚举为字符串，时间为 RFC3339 UTC；无需拟合旧版格式。较高 schema 不可破坏性打开，错误/损坏文件不自动删除重建。凭据以当前用户 DPAPI 加密，不能导出到普通配置中；不实现旧密文读取和接管备份。
 
-沿用 `Local\\NotifyRedirect.Desktop` 单实例互斥名称，使旧版和新版不能同时消费同一数据目录。二次启动提示从托盘打开。实现每个监视器的 DPI 适配及窗口最小尺寸。
+## 界面和执行模型
 
-## Windows 通知与安装
+四个中文页面：首页（权限和状态、授权/刷新/暂停/退出、预览、启动项）；通知来源（列表、勾选和关键词）；接收渠道（增删改、启停、密码输入、测试）；规则与记录（时间、电脑名称、导入导出、Agent 开关、历史详情、重发和清空）。
 
-沿用 MSIX 包身份 `NotifyRedirect.Desktop`、应用 Id 和原 Publisher；Rust 版本号递增到 `0.2.0.0`。主程序包内名称保持 `NotifyRedirect.exe`，CLI 保持 `tools/notifyredirect-cli.exe`，以减少集成路径变化。
+关闭窗口隐藏到托盘，托盘支持打开、暂停和退出，Explorer 重启后重建图标。原生控件支持滚动、Tab 导航和每监视器 DPI。初始 1060×760 DIP，最小 850×620 DIP。
 
-保留 `userNotificationListener`、`internetClient`、`runFullTrust` 能力和主动启用的 startupTask。Rust 通过 WinRT `UserNotificationListener` 获取权限和通知，不承诺换语言可以绕过 Windows 的授权与清单要求。
+UI 线程管理窗口和发起 WinRT 授权；通知读取在初始化 WinRT 的工作线程执行。后台协调线程独占 SQLite，独立网络线程发送请求。UI 不等待数据库或网络；每次状态变化保存成功后才发布快照。退出停止入口和新发送，最多等待 5 秒；未确认在途请求重启后记为不确定。
 
-首次授权只建立现有通知基线；后续使用通知变化事件与每 5 秒补偿读取。来源键沿用应用 AUMID、通知 Id 和创建时间；无文本跳过，单条读取异常不终止监听。权限拒绝、撤销和 API 不可用分别反馈，不能显示成已正常监听。
+## Windows 通知
 
-继续使用 MSIX 构建及开发签名流程，不自动安装 APP、信任证书或向真实机器人发送消息。锁屏但保持登录、唤醒和联网的通知链路需实机验收，构建通过不代表锁屏通过。
+使用 UserNotificationListener 和 MSIX 的 userNotificationListener、internetClient、runFullTrust 能力；用户明确请求授权，拒绝、撤销、未授权和不可用分别显示。
 
-## 业务兼容
+首次成功读取仅建立当前通知基线，不补发旧通知；随后监听事件并每 5 秒补偿读取。来源用 AUMID，通知键由 AUMID、通知 Id、创建时间组成，格式按新版定义。读取后再次检查权限，撤销时丢弃本批。无文本跳过，单条异常不影响其他项。普通通知不推断任务成功。
 
-以当前源码和测试为行为依据，迁移以下合同：
+锁屏仍需保持用户登录、电脑唤醒和联网。授权、ChatGPT/Cursor 原始内容及 Win+L 后的转发需要安装后的实机验收。
 
-1. 默认暂停、默认不勾选任何来源。包含关键词任意匹配，排除优先，比较行为与现版保持一致。
-2. 本地时间计算；开始包含、结束不包含；跨午夜星期归开始日；多规则取并集；全天独立表示，相等起止时间的普通规则无效。
-3. 同时校验事件发生时间和当前时间，时段外新消息不积累补发；消息超过过去 24 小时或超过未来 5 分钟不接受。每次自动发送和重试重新检查暂停、时段、来源及渠道。
-4. 同来源键和内容去重；未开始发送且从未重试的待发消息可被更新，保持原过期时间；已发送后的更新形成新消息。观察账本与入队在同一事务提交。
-5. 每消息、渠道、分段持久化状态；成功分段不自动重发。最多 5 次自动重试，遵守平台 Retry-After 和 24 小时有效期。
-6. 超时、取消及进程退出前发送结果未确认时记为不确定，不自动重试；手动重发可能重复，界面明确说明。重发仍服从规则。
-7. 正文保留 7 天、状态保留 30 天；清空历史同时取消待发队列；导出不含凭据和历史，导入停用渠道和本机入口并重新生成渠道 Id。
+## 规则和持久队列
 
-迁移所有现有测试覆盖的行为。若现版存在缺陷，先以回归测试记录并单独说明修正，不把非兼容变化混入重写。
+- 默认暂停且不选中任何来源；关键词按 Unicode 小写后子串匹配，空白词忽略，排除优先；包含列表无有效词时不限。
+- 本地时间、开始包含/结束不包含，跨午夜星期按开始日，多规则取并集；全天独立选项，普通规则起止相等无效。星期使用 1=周一至 7=周日。
+- 事件超过过去 24 小时或未来 5 分钟拒绝；事件时间与接收当前时间均须命中规则。时段外新消息不排队、不补发；每次实际发送和重试前再检查暂停、时段、来源和渠道。
+- 观察去重与入队同一事务；同键同内容不重复发。仅在所有分段均未尝试发送时替换内容并保留原过期时间；已尝试后的更新形成新消息。渠道及分段各自保存状态。
+- 接收后恰好 24 小时过期；最多 5 次重试，延迟 30 秒、2 分钟、10 分钟、30 分钟、2 小时，并取更长的 Retry-After。
+- 超时、取消、传输中断和进程退出前未确认的发送记为不确定，不自动重试；能够证明未发送的连接失败可重试。手动重发失败/不确定项须提示可能重复，仍服从规则。
+- 正文保留 7 天，状态保留 30 天；清空历史取消待发队列，在途完成回调不能重新创建已删除记录。导出不含密钥和历史，导入停用渠道和入口并重新生成渠道 Id。
 
-## 渠道和网络
+## 渠道
 
-保留飞书、企业微信和已有钉钉旧 Webhook；不声称支持钉钉新机器人方案。保持现有 HTTPS 官方地址和路径限制，禁止跳转；Webhook 和签名密钥只由凭据模块解密后使用。
+保留飞书、企业微信和已有钉钉旧 Webhook；不新增钉钉机器人方案。按平台官方协议实现签名和消息体，不要求与旧版内部实现一致。仅允许相应官方 HTTPS host/path，禁止重定向，TLS 使用 Windows 系统能力。
 
-迁移现有文本格式、状态标签、电脑名、时间、可选项目、UTF-8 分段预算、总长度限制和截断标记。保持飞书秒级时间戳与签名、钉钉毫秒时间戳与签名、企业微信 text 请求格式。
+文本包含来源、标题、正文、状态、电脑名、时间和可选项目。总 UTF-8 大小最多 65536 字节，截断时加说明；企业微信完整分段含序号 <=1800 字节，其他 <=15000 字节，不切断 Unicode 字符。分段格式为 `[i/n]\n`，单段不加序号。
 
-请求总超时 15 秒，限制读取平台响应大小。保持 HTTP 限流、服务错误、业务结果码、永久失败及不确定结果的分类；日志只显示脱敏错误，不保存完整平台响应或密钥。平台真实可用性继续按手机收件实测标注。
+渠道请求总 deadline 15 秒，响应最多 64 KiB。HTTP 429/5xx 可重试，其他明确拒绝永久失败；平台结果码需确认成功，错误 JSON、缺失结果码及无法确认的响应记为不确定。错误文案脱敏，不记录完整响应、Webhook 或密钥。真实手机收件另行实测。
 
-## Agent API 与 CLI
+## 全新 Agent 接口与 CLI
 
-保持 `127.0.0.1:17841` 的 `POST /v1/events`、Bearer 验证、application/json、128 KiB 请求体上限，以及 202/400/401/413/415 的响应合同。采用常量时间令牌比较，限制 HTTP 头、读写等待和连接数量，服务可随开关启停；不绑定 LAN 地址，不启用 CORS。
+API 默认关闭，启用时只监听 `127.0.0.1:17842`（避开旧版默认端口），POST `/v1/events`，application/json，Bearer token 存于新版 DPAPI 凭据。本版本协议标识为 `version:1`，与旧版的相同版本数字不表示互通。
 
-保持 version=1 字段名、大小写敏感状态枚举、字段长度和时间校验。对字符串长度显式匹配现版 UTF-16 计数规则，覆盖中文及非 BMP 字符边界。202 只代表本机已接收，不代表手机收到；未知来源先登记，勾选并保存后后续事件才可转发。
+事件字段：version、event_id、source、title、body、state、occurred_at、project、session_id。必需 version=1、非空 event_id/source/title；state 缺省 unknown，允许 unknown/turn_ended/process_exited/succeeded/failed/waiting_input；occurred_at 缺省当前 UTC。按 Unicode 字符计数，source/event_id/title/body 上限 80/200/1000/65536；请求体额外限制 128 KiB。
 
-CLI 保留 `send --source --title --body --state`、`send --stdin-json` 和帮助，退出码保持成功 0、失败 1，提交超时 3 秒且禁止重定向。只读打开数据库，不执行崩溃恢复或写配置。现有 integrations 下四类适配器通过协议兼容测试。
+持久化接受后返回 202（不代表已送达），参数错误 400、鉴权失败 401、超限 413、类型错误 415、存储/协调器不可用 503。来源先登记，用户勾选后后续事件才转发；重试同 event_id 不重复入队。常量时间 token 比较，不开放 LAN 或 CORS。
 
-## 数据保留与升级
-
-沿用当前 SQLite schema v1、表名、配置 key、JSON PascalCase 字段、数字枚举、UTC 时间串、消息/来源标识和 DPAPI 当前用户保护格式。JSON 兼容缺失字段的现版默认值；未知更高数据库版本必须拒绝启动且不改动文件。
-
-数据路径沿用 `%LOCALAPPDATA%/NotifyRedirect/notifyredirect.db` 及当前 MSIX 重定向位置。CLI 沿用包目录发现逻辑；若发现多个候选且无法唯一确定，不随意选取或写入文件，提示启动对应桌面 APP。
-
-首次由 Rust 接管已有库，在校验 schema 后、任何写操作前用 SQLite 在线备份生成带时间戳的完整备份（包含已提交 WAL 内容）。备份失败时停止接管并保留原库；空库则直接初始化。保持 schema v1，不在此次引入不可逆结构变更。
-
-Rust 退出后旧版仍能读取该 schema 和配置。开发验证一律使用合成数据与临时数据库，不读取或发送真实用户通知。兼容测试覆盖旧版生成的配置、数字枚举、DPAPI 密文、时间精度、队列状态以及 CLI 只读路径。
+CLI 提供 `send --source NAME --title TITLE --body BODY [--state unknown]`、`send --stdin-json`、`--help` 及可选 `--data-dir`，只读新版凭据并提交本机 API，超时 3 秒且不跟随跳转；成功 0、失败 1。为四类 Agent 编写新版独立接入示例，不修改或保证旧示例工作。
 
 ## 验证和交付
 
-自动验证分三层：核心时间/过滤/事件/分段测试；临时 SQLite 的事务、恢复、保留和旧格式互通测试；本机模拟服务器的 API 鉴权、请求边界、CLI、签名和渠道失败分类测试。复用现有测试用例含义，不要求 Rust 测试数与 C# 相同。
+测试以本设计的新合同为依据，不生成 C# fixture、不执行跨语言互通或旧版回归。覆盖规则边界、Unicode、去重事务、进程恢复、队列、DPAPI 往返、模拟渠道、HTTP deadline/长度、API/CLI 和原生窗口冒烟；只使用合成数据、临时目录和模拟网络。
 
-Windows 集成验证包括 Release 构建、Clippy、格式检查、MSIX 清单/文件结构、DPAPI 同用户往返、原生窗口和托盘启动冒烟。编译问题需修复并重跑受影响检查，不能把未执行的检查写为通过。
+执行格式检查、Clippy、全部 Rust 测试、Release 构建、MSIX 内容与签名验证。记录 EXE、CLI、stage、MSIX 的字节数及相对旧包的缩减。不自动安装、信任开发证书或发送真实机器人消息。
 
-实机验收另行记录：安装升级与回退、授权拒绝与撤销、ChatGPT/Cursor 通知、Win+L 锁屏、启动项、UI 缩放和键盘操作、真实机器人手机收件、网络中断与进程强制结束。未完成项明确标注。
-
-交付包含 Rust 源码、锁定依赖、可重复的构建/验证/MSIX 脚本、开发签名包、兼容与体积验证报告、更新的中文使用说明。保留原 C# 构建脚本，Rust 使用独立入口，待验收后再决定替换默认入口。
-
-## 后续实施顺序
-
-1. Rust workspace 与核心合同及回归测试。
-2. SQLite、DPAPI、旧格式兼容和队列恢复。
-3. 系统 HTTP、三渠道、Agent API 和 CLI。
-4. Windows 通知、原生四页设置窗口、托盘及启动项。
-5. MSIX、自动验证、包体积比较与实机验收说明。
-
-本文件审阅通过后，编写逐步实施计划，再按选择的执行方式开始实现。当前不因方向获批而把设计、计划或验收视为已获批准或已完成。
-
-## 技术依据
-
-- 现有项目：`README.md`、`src/`、`tests/`、`scripts/Build-Msix.ps1`、`packaging/AppxManifest.xml`。
-- Rust for Windows：https://learn.microsoft.com/en-us/windows/dev-environment/rust/rust-for-windows
-- 通知监听：https://learn.microsoft.com/en-us/windows/uwp/design/shell/tiles-and-notifications/notification-listener
+交付 Rust 源码、锁定依赖、独立构建/签名/验证脚本、新包、中文说明和体积报告。安装、授权/撤销、锁屏、启动项、缩放/键盘、真实手机收件和进程中断恢复明确区分已验收与待实机验收。原 C# 工程保持原状，不要求其作为 Rust 发布检查的一部分。

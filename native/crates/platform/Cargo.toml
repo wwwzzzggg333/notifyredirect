@@ -1,0 +1,12 @@
+[package]
+name = "notifyredirect-platform"
+version.workspace = true
+edition.workspace = true
+[dependencies]
+serde_json.workspace = true
+chrono.workspace = true
+windows.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+base64.workspace = true
+notifyredirect-core = { path = "../core" }

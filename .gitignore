@@ -7,3 +7,5 @@ artifacts/
 *.cer
 *.db*
 .vs/
+
+native/target/

@@ -1,0 +1,11 @@
+[package]
+name = "notifyredirect-storage"
+version.workspace = true
+edition.workspace = true
+[dependencies]
+serde_json.workspace = true
+rusqlite.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+notifyredirect-core = { path = "../core" }
+serde.workspace = true
