@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust verify and package
+    runs-on: windows-latest
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/.tools/rust-build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.96"
+          components: rustfmt, clippy
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+          cache-on-failure: true
+
+      - name: Verify
+        shell: pwsh
+        run: ./scripts/Verify-Rust.ps1 -SkipUserSession
+
+      - name: Package unsigned MSIX
+        shell: pwsh
+        run: ./scripts/Build-RustMsix.ps1
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: NotifyRedirect-Native-1.0.0-x64
+          path: |
+            artifacts/rust/NotifyRedirect-Native-1.0.0-x64.msix
+            artifacts/rust/size-report.json
+          if-no-files-found: error
