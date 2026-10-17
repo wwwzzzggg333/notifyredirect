@@ -1,3 +1,5 @@
+> **新增 Rust 原生版（全新版本）**：已实现轻量原生窗口、托盘和转发功能，不依赖 .NET、不迁移旧数据。请查看 [新版使用与构建说明](docs/rust-native.md) 和 [新版 Agent 接入](integrations/native/README.md)。下面保留的是原 .NET 版说明。
+
 # NotifyRedirect · Windows 通知转发器
 
 把所选 Windows 应用的通知转发到手机上的飞书、企业微信或已有钉钉群机器人。每个人独立安装、自己配置接收渠道，电脑直接发送，无需运营云服务。当前为 Windows 11 x64 开发验收版。

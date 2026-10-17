@@ -1,39 +1,316 @@
-use notifyredirect_core::*;use rusqlite::{Connection,params,OptionalExtension};use std::path::Path;
-fn db<T>(r:rusqlite::Result<T>)->Result<T>{r.map_err(|_|"本地数据库操作失败".into())}
-fn json<T:serde::Serialize>(v:&T)->Result<String>{serde_json::to_string(v).map_err(|_|"数据编码失败".into())}
-fn decode<T:serde::de::DeserializeOwned>(s:&str)->Result<T>{serde_json::from_str(s).map_err(|_|"本地数据格式无效".into())}
-pub struct Store{conn:Connection}
-impl Store{
- pub fn open(path:&Path)->Result<Self>{if let Some(parent)=path.parent(){std::fs::create_dir_all(parent).map_err(|_|"无法创建本地数据目录")?}Self::initialize(db(Connection::open(path))?)}
- pub fn open_memory()->Result<Self>{Self::initialize(db(Connection::open_in_memory())?)}
- pub fn read_only(path:&Path)->Result<Self>{let c=db(Connection::open_with_flags(path,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY))?;Self::check(&c)?;Ok(Self{conn:c})}
- fn check(c:&Connection)->Result<()>{let version:i32=db(c.query_row("PRAGMA user_version",[],|r|r.get(0)))?;if version>1{return Err("数据版本高于程序版本，原数据未修改".into())}Ok(())}
- fn initialize(c:Connection)->Result<Self>{Self::check(&c)?;db(c.busy_timeout(std::time::Duration::from_secs(2)))?;db(c.execute_batch("PRAGMA journal_mode=WAL;CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY,value TEXT NOT NULL);CREATE TABLE IF NOT EXISTS ledger(source TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,touched INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY,source TEXT NOT NULL,payload TEXT NOT NULL,received INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS deliveries(id TEXT PRIMARY KEY,message TEXT NOT NULL,channel TEXT NOT NULL,status TEXT NOT NULL,payload TEXT NOT NULL);CREATE INDEX IF NOT EXISTS due_status ON deliveries(status);PRAGMA user_version=1;"))?;let mut s=Self{conn:c};let rows=s.records("SELECT payload FROM deliveries WHERE status='in_flight'")?;for mut r in rows{r.status=Status::Uncertain;r.error=Some("进程退出前结果未确认".into());s.mark(&r)?;}Ok(s)}
- pub fn execute(&mut self,sql:&str)->Result<()>{db(self.conn.execute_batch(sql))}
- pub fn get(&self,key:&str)->Result<Option<String>>{db(self.conn.query_row("SELECT value FROM config WHERE key=?1",[key],|r|r.get(0)).optional())}
- pub fn set(&mut self,key:&str,value:&str)->Result<()>{db(self.conn.execute("INSERT INTO config VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![key,value]))?;Ok(())}
- pub fn settings(&self)->Result<Settings>{let s=match self.get("settings")?{Some(v)=>decode(&v)?,None=>Settings::default()};s.validate()?;Ok(s)}
- pub fn save_settings(&mut self,s:&Settings)->Result<()>{s.validate()?;self.set("settings",&json(s)?)}
- pub fn has_baseline(&self)->Result<bool>{Ok(self.get("baseline")?.as_deref()==Some("yes"))}
- pub fn set_baseline(&mut self)->Result<()>{self.set("baseline","yes")}
- pub fn message(&self,id:&str)->Result<Option<Message>>{let s:Option<String>=db(self.conn.query_row("SELECT payload FROM messages WHERE id=?1",[id],|r|r.get(0)).optional())?;s.map(|s|decode(&s)).transpose()}
- fn records(&self,sql:&str)->Result<Vec<DeliveryRecord>>{let mut q=db(self.conn.prepare(sql))?;let rows=db(q.query_map([],|r|r.get::<_,String>(0)))?;let mut out=vec![];for r in rows{out.push(decode(&db(r)?)?)}Ok(out)}
- pub fn history(&self)->Result<Vec<DeliveryRecord>>{self.records("SELECT payload FROM deliveries WHERE status<>'expanded' ORDER BY rowid DESC LIMIT 200")}
- pub fn due(&self,now:UtcTime)->Result<Vec<DeliveryRecord>>{Ok(self.records("SELECT payload FROM deliveries WHERE status IN ('pending','retryable_failed') ORDER BY rowid")?.into_iter().filter(|d|d.next.is_none_or(|t|t<=now)).take(20).collect())}
- pub fn mark(&mut self,r:&DeliveryRecord)->Result<()>{db(self.conn.execute("UPDATE deliveries SET status=?2,payload=?3 WHERE id=?1",params![r.id,status(r.status),json(r)?]))?;Ok(())}
- pub fn ingest(&mut self,m:&Message,baseline:bool,settings:&Settings,should_queue:bool,now:UtcTime)->Result<Observation>{let tx=db(self.conn.transaction())?;let old:Option<String>=db(tx.query_row("SELECT fingerprint FROM ledger WHERE source=?1",[&m.source_key],|r|r.get(0)).optional())?;let fp=fingerprint(m);let observation=if baseline{Observation::Baseline}else{match old{None=>Observation::New,Some(s)if s==fp=>Observation::Duplicate,_=>Observation::Changed}};
- db(tx.execute("INSERT INTO ledger VALUES(?1,?2,?3) ON CONFLICT(source) DO UPDATE SET fingerprint=excluded.fingerprint,touched=excluded.touched",params![m.source_key,fp,now.timestamp_millis()]))?;
- if matches!(observation,Observation::New|Observation::Changed)&&should_queue{
- let existing:Option<(String,i64)>=db(tx.query_row("SELECT id,received FROM messages WHERE source=?1 AND EXISTS(SELECT 1 FROM deliveries WHERE message=messages.id) AND NOT EXISTS(SELECT 1 FROM deliveries WHERE message=messages.id AND (status NOT IN('pending','expanded') OR json_extract(payload,'$.retries')<>0)) ORDER BY received DESC LIMIT 1",[&m.source_key],|r|Ok((r.get(0)?,r.get(1)?))).optional())?;
- let mut m=m.clone();let received=if let Some((key,time))=existing{m.id=key;db(tx.execute("DELETE FROM deliveries WHERE message=?1",[&m.id]))?;time}else{now.timestamp_millis()};db(tx.execute("INSERT INTO messages VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",params![m.id,m.source_key,json(&m)?,received]))?;
- for c in settings.channels.iter().filter(|c|c.enabled){let d=DeliveryRecord{id:id(),message_id:m.id.clone(),channel_id:c.id.clone(),part:-1,body:None,status:Status::Pending,retries:0,next:None,expires:UtcTime::from_timestamp_millis(received).ok_or("接收时间无效")?+chrono::Duration::hours(24),error:None};db(tx.execute("INSERT INTO deliveries VALUES(?1,?2,?3,?4,?5)",params![d.id,d.message_id,d.channel_id,status(d.status),json(&d)?]))?;}}
- db(tx.commit())?;Ok(observation)}
- pub fn expand(&mut self,parent:&DeliveryRecord,parts:&[String])->Result<()>{let tx=db(self.conn.transaction())?;for(i,body)in parts.iter().enumerate(){let d=DeliveryRecord{id:id(),part:i as i32,body:Some(body.clone()),..parent.clone()};db(tx.execute("INSERT INTO deliveries VALUES(?1,?2,?3,?4,?5)",params![d.id,d.message_id,d.channel_id,status(d.status),json(&d)?]))?;}let p=DeliveryRecord{status:Status::Expanded,..parent.clone()};db(tx.execute("UPDATE deliveries SET status=?2,payload=?3 WHERE id=?1",params![p.id,status(p.status),json(&p)?]))?;db(tx.commit())?;Ok(())}
- pub fn purge(&mut self,now:UtcTime)->Result<()>{let tx=db(self.conn.transaction())?;db(tx.execute("UPDATE messages SET payload=json_set(payload,'$.body','') WHERE received<=?1",[(now-chrono::Duration::days(7)).timestamp_millis()]))?;db(tx.execute("UPDATE deliveries SET payload=json_set(payload,'$.body',NULL) WHERE message IN(SELECT id FROM messages WHERE received<=?1)",[(now-chrono::Duration::days(7)).timestamp_millis()]))?;db(tx.execute("DELETE FROM deliveries WHERE message IN(SELECT id FROM messages WHERE received<=?1)",[(now-chrono::Duration::days(30)).timestamp_millis()]))?;db(tx.execute("DELETE FROM messages WHERE received<=?1",[(now-chrono::Duration::days(30)).timestamp_millis()]))?;db(tx.execute("DELETE FROM ledger WHERE touched<=?1",[(now-chrono::Duration::days(30)).timestamp_millis()]))?;db(tx.commit())?;
- for mut d in self.records("SELECT payload FROM deliveries WHERE status IN('pending','retryable_failed','in_flight')")?{if d.expires<=now{d.status=Status::Expired;d.error=Some("超过24小时".into());self.mark(&d)?}}Ok(())}
- pub fn clear_history(&mut self)->Result<()>{db(self.conn.execute_batch("BEGIN;DELETE FROM deliveries;DELETE FROM messages;COMMIT;"))}
- pub fn retry(&mut self,id:&str,now:UtcTime)->Result<()>{if let Some(mut d)=self.history()?.into_iter().find(|d|d.id==id&&matches!(d.status,Status::PermanentFailed|Status::RetryableFailed|Status::Uncertain)&&d.part>=0){if d.expires<=now{return Err("消息已过期".into())}d.status=Status::Pending;d.retries=0;d.next=None;d.error=None;self.mark(&d)?}Ok(())}
+use notifyredirect_core::*;
+use rusqlite::{Connection, OptionalExtension, params};
+use std::path::Path;
+fn db<T>(r: rusqlite::Result<T>) -> Result<T> {
+    r.map_err(|_| "本地数据库操作失败".into())
 }
-fn status(s:Status)->String{serde_json::to_string(&s).unwrap().trim_matches('"').into()}
-pub fn export(s:&Settings)->Result<String>{let mut s=s.clone();s.api_enabled=false;for c in &mut s.channels{c.enabled=false}json(&s)}
-pub fn import(text:&str)->Result<Settings>{let mut s:Settings=decode(text)?;s.validate()?;s.api_enabled=false;for c in &mut s.channels{c.id=id();c.enabled=false}Ok(s)}
+fn json<T: serde::Serialize>(v: &T) -> Result<String> {
+    serde_json::to_string(v).map_err(|_| "数据编码失败".into())
+}
+fn decode<T: serde::de::DeserializeOwned>(s: &str) -> Result<T> {
+    serde_json::from_str(s).map_err(|_| "本地数据格式无效".into())
+}
+pub struct Store {
+    conn: Connection,
+}
+impl Store {
+    pub fn open(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|_| "无法创建本地数据目录")?
+        }
+        Self::initialize(db(Connection::open(path))?)
+    }
+    pub fn open_memory() -> Result<Self> {
+        Self::initialize(db(Connection::open_in_memory())?)
+    }
+    pub fn read_only(path: &Path) -> Result<Self> {
+        let c = db(Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ))?;
+        Self::check(&c)?;
+        Ok(Self { conn: c })
+    }
+    fn check(c: &Connection) -> Result<()> {
+        let version: i32 = db(c.query_row("PRAGMA user_version", [], |r| r.get(0)))?;
+        if version > 1 {
+            return Err("数据版本高于程序版本，原数据未修改".into());
+        }
+        Ok(())
+    }
+    fn initialize(c: Connection) -> Result<Self> {
+        Self::check(&c)?;
+        db(c.busy_timeout(std::time::Duration::from_secs(2)))?;
+        db(c.execute_batch("PRAGMA journal_mode=WAL;CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY,value TEXT NOT NULL);CREATE TABLE IF NOT EXISTS ledger(source TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,touched INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY,source TEXT NOT NULL,payload TEXT NOT NULL,received INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS deliveries(id TEXT PRIMARY KEY,message TEXT NOT NULL,channel TEXT NOT NULL,status TEXT NOT NULL,payload TEXT NOT NULL);CREATE INDEX IF NOT EXISTS due_status ON deliveries(status);PRAGMA user_version=1;"))?;
+        let mut s = Self { conn: c };
+        let rows = s.records("SELECT payload FROM deliveries WHERE status='in_flight'")?;
+        for mut r in rows {
+            r.status = Status::Uncertain;
+            r.error = Some("进程退出前结果未确认".into());
+            s.mark(&r)?;
+        }
+        Ok(s)
+    }
+    pub fn execute(&mut self, sql: &str) -> Result<()> {
+        db(self.conn.execute_batch(sql))
+    }
+    pub fn get(&self, key: &str) -> Result<Option<String>> {
+        db(self
+            .conn
+            .query_row("SELECT value FROM config WHERE key=?1", [key], |r| r.get(0))
+            .optional())
+    }
+    pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
+        db(self.conn.execute(
+            "INSERT INTO config VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, value],
+        ))?;
+        Ok(())
+    }
+    pub fn settings(&self) -> Result<Settings> {
+        let s = match self.get("settings")? {
+            Some(v) => decode(&v)?,
+            None => Settings::default(),
+        };
+        s.validate()?;
+        Ok(s)
+    }
+    pub fn save_settings(&mut self, s: &Settings) -> Result<()> {
+        s.validate()?;
+        self.set("settings", &json(s)?)
+    }
+    pub fn has_baseline(&self) -> Result<bool> {
+        Ok(self.get("baseline")?.as_deref() == Some("yes"))
+    }
+    pub fn set_baseline(&mut self) -> Result<()> {
+        self.set("baseline", "yes")
+    }
+    pub fn message(&self, id: &str) -> Result<Option<Message>> {
+        let s: Option<String> = db(self
+            .conn
+            .query_row("SELECT payload FROM messages WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
+            .optional())?;
+        s.map(|s| decode(&s)).transpose()
+    }
+    fn records(&self, sql: &str) -> Result<Vec<DeliveryRecord>> {
+        let mut q = db(self.conn.prepare(sql))?;
+        let rows = db(q.query_map([], |r| r.get::<_, String>(0)))?;
+        let mut out = vec![];
+        for r in rows {
+            out.push(decode(&db(r)?)?)
+        }
+        Ok(out)
+    }
+    pub fn history(&self) -> Result<Vec<DeliveryRecord>> {
+        self.records(
+            "SELECT payload FROM deliveries WHERE status<>'expanded' ORDER BY rowid DESC LIMIT 200",
+        )
+    }
+    pub fn due(&self, now: UtcTime) -> Result<Vec<DeliveryRecord>> {
+        Ok(self.records("SELECT payload FROM deliveries WHERE status IN ('pending','retryable_failed') ORDER BY rowid")?.into_iter().filter(|d|d.next.is_none_or(|t|t<=now)).take(20).collect())
+    }
+    pub fn mark(&mut self, r: &DeliveryRecord) -> Result<()> {
+        let mut record = r.clone();
+        if record.status == Status::InFlight {
+            record.attempted = true;
+        }
+        let previous: Option<String> = db(self
+            .conn
+            .query_row(
+                "SELECT payload FROM deliveries WHERE id=?1",
+                [&record.id],
+                |r| r.get(0),
+            )
+            .optional())?;
+        if let Some(old) = previous {
+            record.attempted |= decode::<DeliveryRecord>(&old)?.attempted;
+        }
+        let r = &record;
+        db(self.conn.execute(
+            "UPDATE deliveries SET status=?2,payload=?3 WHERE id=?1",
+            params![r.id, status(r.status), json(r)?],
+        ))?;
+        Ok(())
+    }
+    pub fn save_channel(&mut self, s: &Settings, id: &str, encrypted: &str) -> Result<()> {
+        s.validate()?;
+        let tx = db(self.conn.transaction())?;
+        db(tx.execute(
+            "INSERT INTO config VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![format!("secret:{id}"), encrypted],
+        ))?;
+        db(tx.execute("INSERT INTO config VALUES('settings',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[json(s)?]))?;
+        db(tx.commit())?;
+        Ok(())
+    }
+    pub fn ingest(
+        &mut self,
+        m: &Message,
+        baseline: bool,
+        settings: &Settings,
+        should_queue: bool,
+        now: UtcTime,
+    ) -> Result<Observation> {
+        let tx = db(self.conn.transaction())?;
+        let old: Option<String> = db(tx
+            .query_row(
+                "SELECT fingerprint FROM ledger WHERE source=?1",
+                [&m.source_key],
+                |r| r.get(0),
+            )
+            .optional())?;
+        let fp = fingerprint(m);
+        let observation = if baseline {
+            Observation::Baseline
+        } else {
+            match old {
+                None => Observation::New,
+                Some(s) if s == fp => Observation::Duplicate,
+                _ => Observation::Changed,
+            }
+        };
+        db(tx.execute("INSERT INTO ledger VALUES(?1,?2,?3) ON CONFLICT(source) DO UPDATE SET fingerprint=excluded.fingerprint,touched=excluded.touched",params![m.source_key,fp,now.timestamp_millis()]))?;
+        if matches!(observation, Observation::New | Observation::Changed) && should_queue {
+            let existing:Option<(String,i64)>=db(tx.query_row("SELECT id,received FROM messages WHERE source=?1 AND EXISTS(SELECT 1 FROM deliveries WHERE message=messages.id) AND NOT EXISTS(SELECT 1 FROM deliveries WHERE message=messages.id AND (status NOT IN('pending','expanded') OR json_extract(payload,'$.retries')<>0 OR COALESCE(json_extract(payload,'$.attempted'),0)<>0)) ORDER BY received DESC LIMIT 1",[&m.source_key],|r|Ok((r.get(0)?,r.get(1)?))).optional())?;
+            let mut m = m.clone();
+            let received = if let Some((key, time)) = existing {
+                m.id = key;
+                db(tx.execute("DELETE FROM deliveries WHERE message=?1", [&m.id]))?;
+                time
+            } else {
+                now.timestamp_millis()
+            };
+            db(tx.execute("INSERT INTO messages VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",params![m.id,m.source_key,json(&m)?,received]))?;
+            for c in settings.channels.iter().filter(|c| c.enabled) {
+                let d = DeliveryRecord {
+                    id: id(),
+                    message_id: m.id.clone(),
+                    channel_id: c.id.clone(),
+                    part: -1,
+                    body: None,
+                    status: Status::Pending,
+                    retries: 0,
+                    attempted: false,
+                    next: None,
+                    expires: UtcTime::from_timestamp_millis(received).ok_or("接收时间无效")?
+                        + chrono::Duration::hours(24),
+                    error: None,
+                };
+                db(tx.execute(
+                    "INSERT INTO deliveries VALUES(?1,?2,?3,?4,?5)",
+                    params![
+                        d.id,
+                        d.message_id,
+                        d.channel_id,
+                        status(d.status),
+                        json(&d)?
+                    ],
+                ))?;
+            }
+        }
+        db(tx.commit())?;
+        Ok(observation)
+    }
+    pub fn expand(&mut self, parent: &DeliveryRecord, parts: &[String]) -> Result<()> {
+        let tx = db(self.conn.transaction())?;
+        for (i, body) in parts.iter().enumerate() {
+            let d = DeliveryRecord {
+                id: id(),
+                part: i as i32,
+                body: Some(body.clone()),
+                ..parent.clone()
+            };
+            db(tx.execute(
+                "INSERT INTO deliveries VALUES(?1,?2,?3,?4,?5)",
+                params![
+                    d.id,
+                    d.message_id,
+                    d.channel_id,
+                    status(d.status),
+                    json(&d)?
+                ],
+            ))?;
+        }
+        let p = DeliveryRecord {
+            status: Status::Expanded,
+            ..parent.clone()
+        };
+        db(tx.execute(
+            "UPDATE deliveries SET status=?2,payload=?3 WHERE id=?1",
+            params![p.id, status(p.status), json(&p)?],
+        ))?;
+        db(tx.commit())?;
+        Ok(())
+    }
+    pub fn purge(&mut self, now: UtcTime) -> Result<()> {
+        let tx = db(self.conn.transaction())?;
+        db(tx.execute(
+            "UPDATE messages SET payload=json_set(payload,'$.body','') WHERE received<=?1",
+            [(now - chrono::Duration::days(7)).timestamp_millis()],
+        ))?;
+        db(tx.execute("UPDATE deliveries SET payload=json_set(payload,'$.body',NULL) WHERE message IN(SELECT id FROM messages WHERE received<=?1)",[(now-chrono::Duration::days(7)).timestamp_millis()]))?;
+        db(tx.execute(
+            "DELETE FROM deliveries WHERE message IN(SELECT id FROM messages WHERE received<=?1)",
+            [(now - chrono::Duration::days(30)).timestamp_millis()],
+        ))?;
+        db(tx.execute(
+            "DELETE FROM messages WHERE received<=?1",
+            [(now - chrono::Duration::days(30)).timestamp_millis()],
+        ))?;
+        db(tx.execute(
+            "DELETE FROM ledger WHERE touched<=?1",
+            [(now - chrono::Duration::days(30)).timestamp_millis()],
+        ))?;
+        db(tx.commit())?;
+        for mut d in self.records("SELECT payload FROM deliveries WHERE status IN('pending','retryable_failed','in_flight')")?{if d.expires<=now{d.status=Status::Expired;d.error=Some("超过24小时".into());self.mark(&d)?}}
+        Ok(())
+    }
+    pub fn clear_history(&mut self) -> Result<()> {
+        db(self
+            .conn
+            .execute_batch("BEGIN;DELETE FROM deliveries;DELETE FROM messages;COMMIT;"))
+    }
+    pub fn retry(&mut self, id: &str, now: UtcTime) -> Result<()> {
+        if let Some(mut d) = self.history()?.into_iter().find(|d| {
+            d.id == id
+                && matches!(
+                    d.status,
+                    Status::PermanentFailed | Status::RetryableFailed | Status::Uncertain
+                )
+                && d.part >= 0
+        }) {
+            if d.expires <= now {
+                return Err("消息已过期".into());
+            }
+            d.status = Status::Pending;
+            d.retries = 0;
+            d.next = None;
+            d.error = None;
+            self.mark(&d)?
+        }
+        Ok(())
+    }
+}
+fn status(s: Status) -> String {
+    serde_json::to_string(&s).unwrap().trim_matches('"').into()
+}
+pub fn export(s: &Settings) -> Result<String> {
+    let mut s = s.clone();
+    s.api_enabled = false;
+    for c in &mut s.channels {
+        c.enabled = false
+    }
+    json(&s)
+}
+pub fn import(text: &str) -> Result<Settings> {
+    let mut s: Settings = decode(text)?;
+    s.validate()?;
+    s.api_enabled = false;
+    for c in &mut s.channels {
+        c.id = id();
+        c.enabled = false
+    }
+    Ok(s)
+}
